@@ -1,0 +1,3 @@
+# Discovery follows authenticated WebUI visibility and effective plugin scope.
+# Legacy allowed_context_ids and share_context_names are ignored.
+{}
