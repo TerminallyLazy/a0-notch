@@ -211,14 +211,14 @@ final class LiveHTTPClientTests: XCTestCase {
     func testNormalChatAPIsUseOwnedSessionAndCSRF() async throws {
         try await withFixture { fixture, client in
             try await self.login(client); _ = try await client.status()
-            let snapshot = try await client.recentSnapshot(context: "fixture-root")
+            let snapshot = try await client.recentSnapshot(context: "fixture-root", incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             XCTAssertEqual(snapshot.lastResponse, "Synthetic answer")
-            try await client.send(context: "fixture-root", text: "Synthetic reply", messageID: UUID())
-            try await client.setPaused(context: "fixture-root", paused: true)
-            let paused = try await client.recentSnapshot(context: "fixture-root")
+            try await client.send(context: "fixture-root", text: "Synthetic reply", messageID: UUID(), incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            try await client.setPaused(context: "fixture-root", paused: true, incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            let paused = try await client.recentSnapshot(context: "fixture-root", incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             XCTAssertTrue(paused.paused)
-            try await client.setPaused(context: "fixture-root", paused: false)
-            try await client.stop(context: "fixture-root")
+            try await client.setPaused(context: "fixture-root", paused: false, incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            try await client.stop(context: "fixture-root", incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             let id = UUID().uuidString
             let created = try await client.createChat(id: id)
             XCTAssertEqual(created, id)
@@ -234,9 +234,9 @@ final class LiveHTTPClientTests: XCTestCase {
     }
     func testActionsCannotRunBeforeOwnedLoginAndPluginStatus() async throws {
         try await withFixture { fixture, client in
-            await self.expect(.authentication) { try await client.send(context: "fixture-root", text: "Test", messageID: UUID()) }
+            await self.expect(.authentication) { try await client.send(context: "fixture-root", text: "Test", messageID: UUID(), incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") }
             try await self.login(client)
-            await self.expect(.authentication) { try await client.setPaused(context: "fixture-root", paused: true) }
+            await self.expect(.authentication) { try await client.setPaused(context: "fixture-root", paused: true, incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") }
             let counts = try await fixture.counters().counts
             XCTAssertNil(counts["chat_message_async"]); XCTAssertNil(counts["chat_pause"])
         }
@@ -253,14 +253,14 @@ final class LiveHTTPClientTests: XCTestCase {
         for scenario in ["wrong_chat", "missing_chat"] {
             try await withFixture(scenario) { _, client in
                 try await self.login(client); _ = try await client.status()
-                await self.expect(.invalidPayload) { _ = try await client.recentSnapshot(context: "fixture-root") }
+                await self.expect(.invalidPayload) { _ = try await client.recentSnapshot(context: "fixture-root", incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") }
             }
         }
     }
     func testAmbiguousSendIsNeverReplayed() async throws {
         try await withFixture("ambiguous_send") { fixture, client in
             try await self.login(client); _ = try await client.status()
-            await self.expect(.invalidPayload) { try await client.send(context: "fixture-root", text: "Once", messageID: UUID()) }
+            await self.expect(.invalidPayload) { try await client.send(context: "fixture-root", text: "Once", messageID: UUID(), incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") }
             try await Task.sleep(for: .milliseconds(100))
             let counts = try await fixture.counters().counts
             XCTAssertEqual(counts["chat_message_async"], 1)
@@ -269,16 +269,54 @@ final class LiveHTTPClientTests: XCTestCase {
     func testMutationAuthenticationFailureDoesNotFallback() async throws {
         try await withFixture("mutation_forbidden") { fixture, client in
             try await self.login(client); _ = try await client.status()
-            await self.expect(.authentication) { try await client.stop(context: "fixture-root") }
+            await self.expect(.authentication) { try await client.stop(context: "fixture-root", incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") }
             let counts = try await fixture.counters().counts
             XCTAssertEqual(counts["chat_stop"], 1); XCTAssertEqual(counts["login"], 1)
         }
     }
+    func testPagedCatalogAssemblesAtomically() async throws {
+        try await withFixture("paged") { fixture, client in
+            try await self.login(client)
+            let result = try await client.status()
+            XCTAssertEqual(result.contexts.count, 251)
+            XCTAssertNil(result.next_offset)
+            XCTAssertEqual(result.catalog_count, 251)
+            let count = try await fixture.counters().counts["status"]
+            XCTAssertEqual(count, 2)
+        }
+    }
+    func testBadAndMissingPagesNeverReturnPartialCatalog() async throws {
+        for (scenario, error) in [("bad_page", LiveError.invalidPayload), ("missing_page", LiveError.http(409))] {
+            try await withFixture(scenario) { _, client in
+                try await self.login(client)
+                await self.expect(error) { _ = try await client.status() }
+            }
+        }
+    }
+    func testMissingIncarnationNeverSendsAction() async throws {
+        try await withFixture { fixture, client in
+            try await self.login(client); _ = try await client.status()
+            await self.expect(.unsupportedActions) { try await client.send(context: "fixture-root", text: "test", messageID: UUID()) }
+            let counts = try await fixture.counters().counts
+            XCTAssertNil(counts["chat_message_async"])
+        }
+    }
+    func testMultipartAttachmentUsesSelectedIncarnation() async throws {
+        try await withFixture("upload") { fixture, client in
+            try await self.login(client); _ = try await client.status()
+            let file = try LiveAttachment(filename: "sample.txt", data: Data("synthetic attachment".utf8))
+            let receipt = try await client.upload(context: "fixture-root", incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", files: [file], messageID: UUID())
+            XCTAssertEqual(receipt, ["notch-0123456789abcdef.txt"])
+            let count = try await fixture.counters().counts["upload"]
+            XCTAssertEqual(count, 1)
+        }
+    }
+
     func testInvalidMutationInputsMakeNoWriteRequest() async throws {
         try await withFixture { fixture, client in
             try await self.login(client); _ = try await client.status()
-            await self.expect(.invalidPayload) { try await client.send(context: "fixture-root", text: "  ", messageID: UUID()) }
-            await self.expect(.invalidPayload) { try await client.send(context: "", text: "Text", messageID: UUID()) }
+            await self.expect(.invalidPayload) { try await client.send(context: "fixture-root", text: "  ", messageID: UUID(), incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") }
+            await self.expect(.invalidPayload) { try await client.send(context: "", text: "Text", messageID: UUID(), incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") }
             await self.expect(.invalidPayload) { _ = try await client.createChat(id: "") }
             let counts = try await fixture.counters().counts
             XCTAssertNil(counts["chat_message_async"]); XCTAssertNil(counts["chat_chat_create"])
@@ -304,7 +342,7 @@ private final class HTTPFixture {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["python3", root.appendingPathComponent("scripts/m5_http_fixture.py").path,
+        process.arguments = ["python3", root.appendingPathComponent("tests/transport_http_fixture.py").path,
                              "--scenario", scenario, "--ready-file", ready.path]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -356,10 +394,10 @@ extension LiveHTTPClientTests {
         try await withFixture("legacy_actions") { fixture, client in
             try await self.login(client); _ = try await client.status()
             await self.expect(.unsupportedActions) {
-                try await client.send(context: "fixture-root", text: "hello", messageID: UUID())
+                try await client.send(context: "fixture-root", text: "hello", messageID: UUID(), incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             }
-            await self.expect(.unsupportedActions) { try await client.setPaused(context: "fixture-root", paused: true) }
-            await self.expect(.unsupportedActions) { try await client.stop(context: "fixture-root") }
+            await self.expect(.unsupportedActions) { try await client.setPaused(context: "fixture-root", paused: true, incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") }
+            await self.expect(.unsupportedActions) { try await client.stop(context: "fixture-root", incarnation: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") }
             let counts = try await fixture.counters().counts
             XCTAssertNil(counts["chat_message_async"])
             XCTAssertNil(counts["chat_pause"])

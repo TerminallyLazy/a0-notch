@@ -12,6 +12,17 @@ final class LiveProtocolTests: XCTestCase {
         edit(&value)
         return try JSONSerialization.data(withJSONObject: value)
     }
+    func testPaginationIntMaxRejectsWithoutOverflow() throws {
+        for next in [nil, Int.max] as [Int?] {
+            XCTAssertThrowsError(try LiveEnvelope.decode(payload { value in
+                value["schema_version"] = 2; value["page_token"] = self.epoch
+                value["page_offset"] = Int.max; value["catalog_count"] = Int.max
+                if let next { value["next_offset"] = next }
+                var rows = value["contexts"] as! [[String: Any]]
+                rows[0]["incarnation"] = self.epoch; value["contexts"] = rows
+            }))
+        }
+    }
     func testValidEnvelope() throws {
         let result = try LiveEnvelope.decode(payload())
         XCTAssertEqual(result.contexts.first?.id, "root")

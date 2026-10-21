@@ -36,6 +36,7 @@ targets:
         INFOPLIST_FILE: app/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_ENTITLEMENTS: app/A0Notch.entitlements
     dependencies:
       - target: NotchCore
   NotchCoreTests:

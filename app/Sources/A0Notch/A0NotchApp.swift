@@ -30,14 +30,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var settingsWindow: NSWindow?
     private var chatWindow: NSWindow?
+    private var commands: AppCommands?
     private var smokeTask: Task<Void, Never>?
+    private var dictationObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        dictationObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak store] _ in
+            MainActor.assumeIsolated { store?.cancelDictation() }
+        })
+        for event in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
+            dictationObservers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: event, object: nil, queue: .main) { [weak store] _ in
+                MainActor.assumeIsolated { store?.cancelDictation() }
+            })
+        }
         _ = A0Brand.fontsRegistered
         NSApp.applicationIconImage = A0Brand.appIcon
         store.showChats = { [weak self] in self?.openChats() }
         store.showConnection = { [weak self] in self?.connectionSettings() }
         island = IslandWindowController(store: store)
+        if let island {
+            commands = AppCommands(store: store, island: island)
+            store.focusComposer = { [weak island] in island?.enableTextInput() }
+            store.desktop = DesktopZeroController(wardrobe: store.wardrobe, callbacks: .init(
+                islandFrame: { [weak island] in island?.visibleFrame },
+                visibilityChanged: { [weak store] visible in store?.desktopVisible = visible },
+                wardrobeRequested: { [weak store] in store?.open(); store?.wardrobePresented = true },
+                soundToggleRequested: { [weak store] in store?.toggleSound() },
+                sound: { [weak store] cue in
+                    if let sound = NotchSound(rawValue: String(describing: cue)) { store?.sounds?.play(sound) }
+                }))
+        }
+        if !ProcessInfo.processInfo.arguments.contains("--smoke-test") {
+            store.sounds = try? NotchSoundPlayer()
+            store.soundMuted = store.sounds?.isMuted ?? true
+            store.soundVolume = store.sounds?.volume ?? 0.12
+            store.interaction.onCue = { [weak store] cue in
+                if let sound = NotchSound(rawValue: cue) { store?.sounds?.play(sound) }
+            }
+            store.hotkeys = GlobalHotkeys()
+            store.hotkeys?.onAction = { [weak self] action in self?.commands?.global(action) }
+            store.hotkeys?.onChange = { [weak store] in store?.shortcutRevision += 1 }
+            store.hotkeys?.start()
+            store.desktop?.start()
+        }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = A0Brand.menuIcon
         if A0Brand.menuIcon == nil { item.button?.title = "A0" }
@@ -83,7 +118,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         displayItem.submenu = display
         menu.addItem(.separator())
         add(store.connectionLabel, to: menu, action: nil)
-        add("Connection settings…", to: menu, action: #selector(connectionSettings), key: ",")
+        add(store.soundMuted ? "Unmute sounds" : "Mute sounds", to: menu, action: #selector(toggleSound))
+        add("Desktop Zero", to: menu, action: #selector(toggleDesktop))
+        add("Wardrobe…", to: menu, action: #selector(openWardrobe))
+        add("Ask Agent Zero", to: menu, action: #selector(openPrompt))
+        add("Settings…", to: menu, action: #selector(connectionSettings), key: ",")
         add("Disconnect live", to: menu, action: #selector(disconnectLive))
         add("Open Agent Zero WebUI", to: menu, action: #selector(openWebUI))
         add("Quit a0_notch", to: menu, action: #selector(quit), key: "q")
@@ -96,10 +135,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc private func openIsland() { store.open() }
     @objc private func openChats() {
+        store.cancelDictation()
         if chatWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 660),
                                   styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
             window.title = "Agent Zero · Chats"
+            window.identifier = NSUserInterfaceItemIdentifier("notch-chats")
             window.contentView = NSHostingView(rootView: ChatWorkspace(store: store))
             window.minSize = NSSize(width: 780, height: 560)
             window.isReleasedWhenClosed = false
@@ -117,22 +158,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         store.selectDisplay(IslandDisplayChoice(rawValue: raw)); island?.refreshDisplay()
     }
     @objc private func connectionSettings() {
+        store.cancelDictation()
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 680), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            window.title = "a0_notch · Connection"
-            window.contentView = NSHostingView(rootView: ConnectionSettings(store: store))
+            window.title = "a0_notch · Settings"
+            window.contentView = NSHostingView(rootView: ProductSettings(store: store))
             window.isReleasedWhenClosed = false
             window.center(); settingsWindow = window
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
+    @objc private func toggleSound() { store.toggleSound() }
+    @objc private func toggleDesktop() { store.toggleDesktop() }
+    @objc private func openWardrobe() { store.open(); store.wardrobePresented = true }
+    @objc private func openPrompt() { store.navigate(.prompt) }
     @objc private func disconnectLive() { store.disconnectLive() }
     @objc private func openWebUI() { store.openWebUI() }
     @objc private func quit() { NSApp.terminate(nil) }
     func applicationWillTerminate(_ notification: Notification) {
+        for observer in dictationObservers {
+            NotificationCenter.default.removeObserver(observer)
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        dictationObservers.removeAll()
         smokeTask?.cancel()
         store.disconnectLive()
+        commands?.shutdown(); store.hotkeys?.shutdown(); store.desktop?.shutdown(); store.sounds?.shutdown()
         island?.shutdown()
         if let smokeDefaults { UserDefaults.standard.removePersistentDomain(forName: smokeDefaults) }
         if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }

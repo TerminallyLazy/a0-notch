@@ -9,10 +9,16 @@ A native macOS companion for [Agent Zero](https://github.com/agent0ai/agent-zero
 - Three appearances: **Notch**, **Floating Capsule**, and **Slim Bar**, with independent display selection.
 - Automatic discovery of eligible chats visible to the authenticated WebUI session—no context-ID entry or five-chat product cap. Separately created subordinate chats remain separate; in-chat agents appear as activity.
 - Searchable chat selection, actual recent activity, and explicit chat actions. Selecting a chat never sends a message.
-- Selected-chat error/completion auto-open policy, configurable absence/close timers, and explicit launch-at-login controls (OS acceptance still requires validation).
+- Metadata-only FIFO alerts and completion presentation without automatic chat selection, configurable absence/close timers, and explicit launch-at-login controls (OS acceptance still requires validation).
 - Honest disconnected/stale states; mutations require a fresh authenticated connection.
 - App-owned WebUI login and CSRF session; optional account-and-origin-scoped Keychain password storage. No browser cookies, anonymous fallback, or separate public relay port.
-- Original Zero character, Agent Zero identity assets, Rubik, Roboto Mono, and the dark A0 palette.
+- Original Zero character, 13 outfits, desktop drag/return and alert retraction, 28 synthesized sounds, Carbon global shortcuts with recorder/conflict settings, and editing-safe local commands.
+- Explicit selected-chat file staging/upload/cancellation, indeterminate progress and authoritative receipts; bounded diff metadata, not fabricated full diffs.
+- Explicit per-chat **Model preset** selector using A0’s existing override API; no global model-setting mutation.
+- Consent-first Apple dictation, on-device by default, bounded recording and explicit draft insertion; never auto-send.
+- Event-driven island wake policy, persistent avatar transitions and real drag ghost.
+- Origin/account-scoped main/pin/alias/color preferences never restrict all-chat discovery.
+- Agent Zero identity assets, Rubik, Roboto Mono, and the dark A0 palette.
 
 Production demo playback and fake-context menus are removed. Synthetic data lives only in tests.
 
@@ -53,7 +59,7 @@ For an existing installation, preserve plugin configuration/activation and use t
 
 ## Connect
 
-1. Open the menu-bar icon → **Connection settings**.
+1. Open the menu-bar icon → **Settings → Connection**.
 2. Enter the actual server origin and WebUI account. A browser login is intentionally not shared.
 3. Leave password saving off unless you want the app to retain it in Keychain.
 4. Test or connect, then choose a chat. A successful connection with no eligible chats is an empty account/registry, not fabricated activity.

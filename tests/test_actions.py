@@ -7,6 +7,11 @@ import pytest
 from agent import AgentContext, AgentContextType
 from usr.plugins.a0_notch.helpers import actions, http
 from test_m5 import app, client, HEADERS
+from usr.plugins.a0_notch.helpers.incarnation import token
+
+def bound(data):
+    context = next((c for c in AgentContext.all() if c.id == data["context"]), None)
+    return dict(data, incarnation=token(context) if context is not None else "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
 PATH = '/api/plugins/a0_notch/action'
 
@@ -31,13 +36,13 @@ def targets(monkeypatch):
 
 
 def send(id='target'):
-    return dict(action='send', context=id, text='hello', message_id='message-1')
+    return bound(dict(action='send', context=id, text='hello', message_id='message-1'))
 
 
 @pytest.mark.parametrize('action', ['send', 'pause', 'resume', 'stop'])
 def test_missing_never_creates_or_mutates(targets, action):
     rows, _ = targets
-    data = send('absent') if action == 'send' else dict(action=action, context='absent')
+    data = send('absent') if action == 'send' else bound(dict(action=action, context='absent'))
     with pytest.raises(actions.TargetUnavailable):
         asyncio.run(actions.dispatch(data))
     assert len(rows) == 2
@@ -54,10 +59,10 @@ def test_normal_transformed_message_and_controls(targets):
     assert message.id == 'message-1'
     actions.mq.log_user_message.assert_called_once_with(rows[0], 'hello transformed', [], 'message-1')
     rows[1].communicate.assert_not_called()
-    assert asyncio.run(actions.dispatch(dict(action='pause', context='target'))) == {'context': 'target', 'pause': True}
+    assert asyncio.run(actions.dispatch(bound(dict(action='pause', context='target')))) == {'context': 'target', 'pause': True}
     assert not rows[1].paused
-    assert asyncio.run(actions.dispatch(dict(action='resume', context='target')))['pause'] is False
-    assert asyncio.run(actions.dispatch(dict(action='stop', context='target')))['stopped'] is False
+    assert asyncio.run(actions.dispatch(bound(dict(action='resume', context='target'))))['pause'] is False
+    assert asyncio.run(actions.dispatch(bound(dict(action='stop', context='target'))))['stopped'] is False
     actions.stop_context.assert_called_once_with(rows[0])
 
 
@@ -93,7 +98,7 @@ def test_strict_validation(data):
 
 
 def test_authenticated_route_and_missing_target(client, targets):
-    assert client.post(PATH, json=dict(action='pause', context='target'), headers=HEADERS).json == {'context': 'target', 'pause': True}
+    assert client.post(PATH, json=bound(dict(action='pause', context='target')), headers=HEADERS).json == {'context': 'target', 'pause': True}
     response = client.post(PATH, json=send('absent'), headers=HEADERS)
     assert response.status_code == 409 and response.json['error'] == 'target_unavailable'
     assert response.headers['Cache-Control'] == 'no-store'

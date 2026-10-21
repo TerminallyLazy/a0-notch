@@ -2,6 +2,11 @@
 from datetime import datetime
 import json
 import math
+from threading import RLock
+
+_discovery_lock = RLock()
+from usr.plugins.a0_notch.helpers.incarnation import token
+from usr.plugins.a0_notch.helpers.pagination import pages, PageExpired
 from helpers.api import Response, session
 from helpers import login, plugins
 from usr.plugins.a0_notch.helpers.relay import relay, valid_id, validate_request, LeaseConflict
@@ -16,7 +21,6 @@ def reply(data, status=200):
     for chunk in json.JSONEncoder(ensure_ascii=True, allow_nan=False, separators=(',', ':')).iterencode(data):
         encoded = chunk.encode('utf-8')
         if len(body) + len(encoded) > MAX_RESPONSE_BYTES:
-            relay.reset()
             body = b'{"ok":false,"error":"snapshot_too_large"}'
             status = 503
             break
@@ -86,7 +90,7 @@ def contexts():
             masked = get_secrets_manager(context).mask_values(context.name, placeholder='[redacted]')
             name = ''.join(c for c in masked if c.isprintable())[:80] or name
         running = bool(context.is_running())
-        row = dict(id=id, name=name, running=running, tool='',
+        row = dict(id=id, incarnation=token(context), name=name, running=running, tool='',
                    state='paused' if context.paused else 'working' if running else 'idle')
         parent = context.output_data.get('parent_context_id')
         if parent:
@@ -106,6 +110,7 @@ async def handle(request, status=False):
             return reply({'ok': False, 'error': 'authentication_required'}, 403)
         if 'a0_notch' not in plugins.get_enabled_plugins(None):
             relay.reset()
+            pages.clear()
             return reply({'ok': False, 'error': 'plugin_disabled'}, 403)
         # Read at most 4097 bytes, before the base handler's unbounded JSON parser.
         if request.content_length is None or request.content_length > 4096 or not request.is_json:
@@ -114,17 +119,29 @@ async def handle(request, status=False):
         if len(raw) > 4096:
             return reply({'ok': False, 'error': 'invalid_request'}, 400)
         data = json.loads(raw)
-        validate_request(data, status)
-        # Old allowed_context_ids/share_context_names are deliberately ignored.
-        rows = contexts()
-        relay.configure(r['id'] for r in rows)
-        if status:
-            payload = dict(ok=True, schema_version=1, plugin_version='0.6.1',
-                           server_epoch=relay.epoch, capabilities=['discovery', 'metadata', 'poll', 'exact_target_actions'],
-                           auth='session_csrf', contexts=rows)
-        else:
-            payload = relay.exchange(data, rows)
-        return reply(payload)
+        continuation = type(data) is dict and 'page_token' in data
+        if not continuation:
+            validate_request(data, status)
+        from agent import AgentContext
+        # Serialize API reconciliation and prevent replacement during projection.
+        # No awaits or agent-loop work occur inside this transaction.
+        with _discovery_lock, AgentContext._contexts_lock:
+            # Old allowed_context_ids/share_context_names are deliberately ignored.
+            rows = contexts()
+            relay.configure({r['id']: r['incarnation'] for r in rows})
+            if continuation:
+                response = pages.next(data, rows, status, relay.epoch, relay=relay)
+            else:
+                if status:
+                    payload = dict(ok=True, schema_version=2, plugin_version='0.8.0',
+                                   server_epoch=relay.epoch, capabilities=['discovery', 'metadata', 'poll', 'exact_target_actions', 'incarnation_actions', 'attachments', 'paged_discovery', 'error_fifo', 'file_diff', 'model_presets'],
+                                   auth='session_csrf', contexts=rows)
+                else:
+                    payload = relay.exchange(data, rows)
+                response = pages.first(payload, status, relay=relay)
+        return reply(response)
+    except PageExpired:
+        return reply({'ok': False, 'error': 'catalog_changed'}, 409)
     except LeaseConflict:
         return reply({'ok': False, 'error': 'lease_conflict'}, 409)
     except (ValueError, TypeError, KeyError):

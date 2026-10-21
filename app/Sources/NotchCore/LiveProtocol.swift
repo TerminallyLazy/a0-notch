@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public enum LiveError: Error, LocalizedError, Equatable {
     case invalidOrigin, authentication, http(Int), invalidPayload, oversized, stale, unsupportedActions
@@ -40,9 +41,15 @@ public struct LiveContext: Codable, Equatable, Identifiable, Sendable {
     public let state: LiveActivity
     public let tool: String
     public let running: Bool
+    public let incarnation: String?
     public let parent_id: String?
     public let last_activity_at: Double?
     public let created_at: Double?
+}
+public struct LiveDiff: Codable, Equatable, Sendable {
+    public let path: String
+    public let added: Int
+    public let removed: Int
 }
 public struct LiveEvent: Codable, Equatable, Sendable {
     public let sequence: Int
@@ -51,12 +58,14 @@ public struct LiveEvent: Codable, Equatable, Sendable {
     public let tool: String
     public let kind: String
     public let observed_at: Double
+    public let incarnation: String?
+    public let diff: LiveDiff?
 }
 public struct LiveEnvelope: Decodable, Sendable {
     public let ok: Bool
     public let schema_version: Int
     public let server_epoch: String
-    public let contexts: [LiveContext]
+    public var contexts: [LiveContext]
     public let cursor: Int?
     public let reset: Bool?
     public let events: [LiveEvent]?
@@ -64,6 +73,10 @@ public struct LiveEnvelope: Decodable, Sendable {
     public let auth: String?
     public let capabilities: [String]?
     public let dropped: [String: Int]?
+    public let page_token: String?
+    public let page_offset: Int?
+    public var next_offset: Int?
+    public let catalog_count: Int?
 
     public static func decode(_ data: Data, status: Bool = false) throws -> Self {
         guard data.count <= 2 * 1024 * 1024 else { throw LiveError.oversized }
@@ -74,18 +87,30 @@ public struct LiveEnvelope: Decodable, Sendable {
         } catch let error as LiveError { throw error }
         catch { throw LiveError.invalidPayload }
     }
-    private func validate(status: Bool) throws {
+    func validate(status: Bool) throws {
         func text(_ value: String, max: Int, empty: Bool = false) -> Bool {
             (empty || !value.isEmpty) && value.count <= max && !value.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
         }
-        guard ok, schema_version == 1, UUID(uuidString: server_epoch) != nil,
+        guard ok, (schema_version == 1 || schema_version == 2), UUID(uuidString: server_epoch) != nil,
               Set(contexts.map(\.id)).count == contexts.count,
               contexts.allSatisfy({ text($0.id, max: 128) && text($0.name, max: 80) && text($0.tool, max: 64, empty: true) })
         else { throw LiveError.invalidPayload }
         guard contexts.allSatisfy({ row in
-            (row.parent_id.map { text($0, max: 128) && $0 != row.id } ?? true)
+            (row.incarnation.map { UUID(uuidString: $0) != nil } ?? true)
+            && (row.parent_id.map { text($0, max: 128) && $0 != row.id } ?? true)
             && [row.last_activity_at, row.created_at].allSatisfy { $0 == nil || ($0!.isFinite && $0! >= 0) }
         }) else { throw LiveError.invalidPayload }
+        if schema_version == 2 && page_token == nil { throw LiveError.invalidPayload }
+        if let page_token {
+            guard UUID(uuidString: page_token) != nil, let page_offset, let catalog_count,
+                  page_offset >= 0, catalog_count >= 0, page_offset <= catalog_count,
+                  contexts.count <= catalog_count - page_offset,
+                  next_offset == nil ? contexts.count == catalog_count - page_offset
+                    : (next_offset! >= page_offset && next_offset! - page_offset == contexts.count && next_offset! < catalog_count),
+                  contexts.allSatisfy({ $0.incarnation != nil }) else { throw LiveError.invalidPayload }
+        } else if page_offset != nil || next_offset != nil || catalog_count != nil {
+            throw LiveError.invalidPayload
+        }
         if status {
             guard auth == "session_csrf", let version = plugin_version, text(version, max: 32),
                   let caps = capabilities, Set(["discovery", "metadata", "poll"]).isSubset(of: Set(caps))
@@ -98,10 +123,18 @@ public struct LiveEnvelope: Decodable, Sendable {
             var last = -1
             let ids = Set(contexts.map(\.id))
             for event in events {
-                guard event.sequence > last, event.sequence <= cursor, ids.contains(event.context_id),
+                guard event.sequence > last, event.sequence <= cursor, (page_token != nil || ids.contains(event.context_id)),
                       text(event.tool, max: 64, empty: true), event.observed_at.isFinite, event.observed_at >= 0,
-                      ["thinking", "tool_start", "tool_end", "finished", "error", "idle"].contains(event.kind)
+                      ["thinking", "tool_start", "tool_end", "finished", "error", "idle", "intervention"].contains(event.kind)
                 else { throw LiveError.invalidPayload }
+                if let incarnation = event.incarnation, UUID(uuidString: incarnation) == nil { throw LiveError.invalidPayload }
+                if let diff = event.diff {
+                    let parts = diff.path.split(separator: "/", omittingEmptySubsequences: false)
+                    guard !diff.path.isEmpty, diff.path.count <= 240, !diff.path.contains("\\"),
+                          parts.allSatisfy({ !$0.isEmpty && !$0.hasPrefix(".") }),
+                          text(diff.path, max: 240), (0...512).contains(diff.added), (0...512).contains(diff.removed)
+                    else { throw LiveError.invalidPayload }
+                }
                 last = event.sequence
             }
         }
@@ -126,7 +159,8 @@ public struct LiveSessionState: Sendable {
     }
     @discardableResult public mutating func accept(_ envelope: LiveEnvelope, generation: UUID, now: TimeInterval) throws -> Bool {
         guard self.generation == generation, mode == .connecting || mode == .live else { return false }
-        guard now.isFinite, let nextCursor = envelope.cursor,
+        guard envelope.next_offset == nil, envelope.catalog_count == nil || envelope.catalog_count == envelope.contexts.count,
+              now.isFinite, let nextCursor = envelope.cursor,
               epoch == nil || (epoch == envelope.server_epoch && nextCursor >= cursor) else { throw LiveError.invalidPayload }
         if let events = envelope.events, epoch != nil,
            events.contains(where: { $0.sequence <= cursor }) { throw LiveError.invalidPayload }
@@ -201,17 +235,90 @@ public struct ChatTarget: Equatable, Sendable {
     public let context: String
     public let generation: UUID
     public let selection: UUID
-    public init(context: String, generation: UUID, selection: UUID) {
-        self.context = context; self.generation = generation; self.selection = selection
+    public let incarnation: String?
+    public init(context: String, generation: UUID, selection: UUID, incarnation: String? = nil) {
+        self.context = context; self.generation = generation; self.selection = selection; self.incarnation = incarnation
     }
 }
 public extension LiveSessionState {
     func permits(_ target: ChatTarget, selected: String, selection: UUID, now: TimeInterval) -> Bool {
         mode == .live && generation == target.generation && target.selection == selection
-        && target.context == selected && contexts.contains { $0.id == selected }
+        && target.context == selected && contexts.contains { $0.id == selected && $0.incarnation == target.incarnation }
         && isFresh(now: now)
     }
     func isFresh(now: TimeInterval) -> Bool {
         mode == .live && now.isFinite && lastAccepted.map { now >= $0 && now - $0 < 10 } == true
+    }
+}
+
+/// Prepared locally before upload. Paths never cross the wire; only a safe basename.
+public struct LiveAttachment: Sendable {
+    public let filename: String
+    public let contentType: String
+    public let data: Data
+    public init(url: URL, remainingBytes: Int = 8 * 1024 * 1024) throws {
+        guard url.isFileURL else { throw LiveError.invalidPayload }
+        let parts = url.path.split(separator: "/", omittingEmptySubsequences: true)
+        guard !parts.isEmpty, !parts.contains(".."), !parts.contains(".") else { throw LiveError.invalidPayload }
+        var directory = Darwin.open("/", O_RDONLY | O_DIRECTORY)
+        guard directory >= 0 else { throw LiveError.invalidPayload }
+        defer { Darwin.close(directory) }
+        for part in parts.dropLast() {
+            let next = String(part).withCString { openat(directory, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW) }
+            guard next >= 0 else { throw LiveError.invalidPayload }
+            Darwin.close(directory); directory = next
+        }
+        let descriptor = String(parts.last!).withCString { openat(directory, $0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) }
+        guard descriptor >= 0 else { throw LiveError.invalidPayload }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_size > 0, info.st_size <= min(8 * 1024 * 1024, remainingBytes) else { throw LiveError.invalidPayload }
+        // Bound the read even if a concurrent writer grows/replaces the path.
+        let data = try handle.read(upToCount: min(8 * 1024 * 1024, max(0, remainingBytes)) + 1) ?? Data()
+        guard data.count <= remainingBytes else { throw LiveError.oversized }
+        try self.init(filename: url.lastPathComponent, data: data)
+    }
+    public init(filename: String, data: Data) throws {
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._-")
+        let types = ["txt":"text/plain", "md":"text/markdown", "csv":"text/csv", "json":"application/json",
+                     "log":"text/plain", "yaml":"application/yaml", "yml":"application/yaml",
+                     "pdf":"application/pdf", "png":"image/png", "jpg":"image/jpeg", "jpeg":"image/jpeg"]
+        let suffix = (filename as NSString).pathExtension.lowercased()
+        guard (1...120).contains(filename.count), filename.unicodeScalars.allSatisfy({ allowed.contains($0) }),
+              filename.first?.isASCII == true, filename.first?.isLetter == true || filename.first?.isNumber == true,
+              !filename.hasSuffix(" "), !filename.hasSuffix("."), let type = types[suffix],
+              !data.isEmpty, data.count <= 8 * 1024 * 1024 else { throw LiveError.invalidPayload }
+        self.filename = filename; self.contentType = type; self.data = data
+    }
+}
+
+
+/// Raised only before any upload request is dispatched.
+public struct UploadPreparationError: Error, Sendable {}
+
+
+public struct ModelPresetList: Decodable, Sendable {
+    public struct Preset: Decodable, Identifiable, Sendable {
+        public let id: String
+        public let label: String
+        public let model: String
+    }
+    public let ok: Bool
+    public let context: String
+    public let incarnation: String
+    public let allowed: Bool
+    public let current_id: String
+    public let current_label: String
+    public let presets: [Preset]
+    public static func decode(_ data: Data, context: String, incarnation: String) throws -> Self {
+        guard data.count <= 512 * 1024, let value = try? JSONDecoder().decode(Self.self, from: data),
+              value.ok, value.context == context, value.incarnation.lowercased() == incarnation.lowercased(),
+              value.presets.count <= 256, Set(value.presets.map(\.id)).count == value.presets.count,
+              value.current_label.count <= 120,
+              value.presets.allSatisfy({ $0.id.count == 64 && $0.label.count <= 120 && $0.model.count <= 120 })
+        else { throw LiveError.invalidPayload }
+        return value
     }
 }

@@ -5,7 +5,7 @@ import time
 import uuid
 
 STATES = frozenset(('idle', 'working', 'thinking', 'browsing', 'delegating', 'finished', 'error', 'paused'))
-KINDS = frozenset(('thinking', 'tool_start', 'tool_end', 'finished', 'error', 'idle'))
+KINDS = frozenset(('thinking', 'tool_start', 'tool_end', 'finished', 'error', 'idle', 'intervention'))
 TOOLS = frozenset(('code_execution_tool', 'code_execution_remote', 'browser', 'search_engine',
     'document_query', 'call_subordinate', 'delegate_parallel', 'response', 'text_editor',
     'text_editor_remote', 'skills_tool', 'memory_load', 'memory_save', 'notify_user',
@@ -52,6 +52,7 @@ class Relay:
         self.clock = clock
         self.epoch = str(uuid.uuid4())
         self.allowed = frozenset()
+        self.incarnations = {}
         self.client = None
         self.deadline = 0
         self.sequence = 0
@@ -74,18 +75,22 @@ class Relay:
         with self.lock:
             self._clear()
             self.allowed = frozenset()
+            self.incarnations.clear()
             self.epoch = str(uuid.uuid4())
 
     def configure(self, ids):
         # Registry discovery is API-only. Preserve the consumer and retained
         # runs across additions; remove revoked/deleted contexts immediately.
         discovered = frozenset(ids)
+        tokens = dict(ids) if isinstance(ids, dict) else {}
         with self.lock:
-            if self.allowed != discovered:
+            replaced = {id for id in discovered if self.incarnations.get(id) != tokens.get(id)}
+            self.incarnations = tokens
+            if self.allowed != discovered or replaced:
                 self.allowed = discovered
-                self.states = {k: v for k, v in self.states.items() if k in discovered}
-                self.runs = {k: v for k, v in self.runs.items() if k in discovered}
-                self.ring = deque((e for e in self.ring if e['context_id'] in discovered), maxlen=64)
+                self.states = {k: v for k, v in self.states.items() if k in discovered and k not in replaced}
+                self.runs = {k: v for k, v in self.runs.items() if k in discovered and k not in replaced}
+                self.ring = deque((e for e in self.ring if e['context_id'] in discovered and e['context_id'] not in replaced), maxlen=64)
 
     def _alive(self):
         if self.client and self.clock() < self.deadline:
@@ -93,7 +98,7 @@ class Relay:
         self._clear()
         return False
 
-    def capture(self, context_id, kind, state, tool='', run=None):
+    def capture(self, context_id, kind, state, tool='', run=None, diff=None, incarnation=None):
         if not self.lock.acquire(blocking=False):
             self.dropped['contention'] += 1
             return False
@@ -104,12 +109,22 @@ class Relay:
             if context_id not in self.allowed or kind not in KINDS or state not in STATES:
                 self.dropped['invalid'] += 1
                 return False
+            if incarnation is not None and self.incarnations.get(context_id) != incarnation:
+                return False
             if run is not None and self.runs.get(context_id) != run:
                 return False
             tool = tool if type(tool) is str and (tool == '' or tool in TOOLS) else 'tool'
             self.sequence += 1
             event = dict(sequence=self.sequence, context_id=context_id, kind=kind,
                          state=state, tool=tool, observed_at=time.time())
+            if context_id in self.incarnations:
+                event['incarnation'] = self.incarnations[context_id]
+            if diff is not None:
+                from usr.plugins.a0_notch.helpers.diffs import safe_path
+                if (type(diff) is dict and set(diff) == {'path', 'added', 'removed'}
+                        and type(diff['path']) is str and safe_path(diff['path'])
+                        and all(type(diff[k]) is int and 0 <= diff[k] <= 512 for k in ('added', 'removed'))):
+                    event['diff'] = dict(diff)
             if len(self.ring) == 64:
                 self.dropped['overflow'] += 1
             self.ring.append(event)
@@ -118,11 +133,12 @@ class Relay:
         finally:
             self.lock.release()
 
-    def begin_run(self, context_id):
+    def begin_run(self, context_id, incarnation=None):
         if not self.lock.acquire(blocking=False):
             return None
         try:
-            if not self._alive() or context_id not in self.allowed:
+            if (not self._alive() or context_id not in self.allowed
+                    or (incarnation is not None and self.incarnations.get(context_id) != incarnation)):
                 return None
             self.run_sequence += 1
             token = (self.generation, self.run_sequence)
@@ -131,6 +147,12 @@ class Relay:
             return token
         finally:
             self.lock.release()
+
+    def renew(self, client, epoch):
+        with self.lock:
+            if not self._alive() or self.client != client or self.epoch != epoch:
+                raise LeaseConflict()
+            self.deadline = self.clock() + 15
 
     def exchange(self, data, contexts):
         """Only API threads call this; contexts are pre-sanitized scalar snapshots."""
@@ -160,17 +182,30 @@ class Relay:
                 if row['id'] not in self.allowed:
                     continue
                 row = dict(row)
+                if row.get('incarnation') != self.incarnations.get(row['id']) and row['id'] in self.incarnations:
+                    raise LeaseConflict()
                 state, tool = self.states.get(row['id'], (row['state'], ''))
                 if row['state'] == 'paused':
+                    if action != 'disconnect' and self.states.get(row['id'], ('', ''))[0] != 'paused':
+                        self.sequence += 1
+                        event = dict(sequence=self.sequence, context_id=row['id'], kind='intervention',
+                                     state='paused', tool='', observed_at=time.time())
+                        if row.get('incarnation'):
+                            event['incarnation'] = row['incarnation']
+                        if len(self.ring) == 64:
+                            self.dropped['overflow'] += 1
+                        self.ring.append(event)
                     state, tool = 'paused', ''
                 elif row['running'] and state in ('idle', 'finished', 'paused'):
                     state, tool = 'working', ''
                 elif not row['running'] and state not in ('finished', 'error'):
                     state, tool = 'idle', ''
+                if action != 'disconnect':
+                    self.states[row['id']] = (state, tool)
                 row.update(state=state, tool=tool)
                 rows.append(row)
             visible_ids = {r['id'] for r in rows}
-            return dict(ok=True, schema_version=1, server_epoch=self.epoch,
+            return dict(ok=True, schema_version=2, server_epoch=self.epoch,
                         cursor=self.sequence, reset=reset, contexts=rows,
                         events=[dict(e) for e in self.ring if e['sequence'] > cursor
                                 and e['context_id'] in visible_ids],

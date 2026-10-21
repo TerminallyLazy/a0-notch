@@ -17,15 +17,19 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>0.8.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>7</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>a0_notch uses your microphone only when you choose Start microphone to dictate a chat draft. Recording stops after 45 seconds. Nothing is sent to Agent Zero until you send the draft.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>a0_notch turns your speech into draft text for your review. On-device recognition is required by default. If you explicitly allow server recognition, audio may be sent to Apple. Dictation never submits a message automatically.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

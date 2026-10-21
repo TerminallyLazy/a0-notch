@@ -1,101 +1,51 @@
-# Notch discovery protocol v1 — plugin 0.6.1
+# Notch protocol schema 2 — plugin 0.8.0
 
-This is the current source contract, superseding the M5 0.5.0 allowlist, name toggle, five-context limit and parent-folding policy. Schema version remains **1**; capabilities negotiate the changed behavior. See verification.md for source versus deployment evidence.
+## Authentication and transport
 
-## Authorization and transport
+Use the deployment's existing WebUI HTTP origin. The app uses an ephemeral cookie jar, explicit WebUI username/password login and session CSRF; no shared browser cookies, anonymous or bearer fallback. HTTPS is mandatory except loopback. Redirects are rejected. Each response is capped at 2 MiB. No new listening port or Unix socket is installed by this implementation.
 
-Use the existing WebUI HTTP service only. Plugin API handlers retain `ApiHandler` session-authentication and CSRF defaults and additionally require configured WebUI login and a matching authenticated session. Anonymous WebUI configurations are refused. There is no bearer-token fallback, new port, UNIX socket, daemon or dependency.
+Plugin routes retain `ApiHandler` authentication and CSRF and recheck enabled scope. Status is `POST /api/plugins/a0_notch/status`. Metadata exchange is `POST /api/plugins/a0_notch/events`, with actions `connect`, `poll`, `disconnect`; the consumer supplies UUID `client_id`, epoch and cursor. One 15-second lease is respected, never stolen. Capture offers metadata to a bounded 64-event ring without waiting; overflow drops oldest, contention/no consumer drops incoming.
 
-Native clients use their own cookie session: POST `/login`, GET `/api/csrf_token`, then protected requests with `X-CSRF-Token`. A login redirect or CSRF response alone is not proof of authentication; require a valid protected status response. Do not follow cross-origin redirects or log credentials, cookies, CSRF tokens or response bodies. Remote origins require HTTPS; discover the actual published service URL rather than assume a port. Keychain and native session policy are client-owned.
+## Discovery and identity
 
-Discovery checks global plugin enablement and each chat's effective project/profile enablement through `get_enabled_plugins(context.agent0)`. All ancestors must also be enabled and visible. Installed-but-disabled routes fail closed; child scope cannot override a disabled ancestor. No caller-supplied context list is accepted.
+Status advertises `discovery`, `metadata`, `poll`, `exact_target_actions`, `incarnation_actions`, `attachments`, `paged_discovery`, `error_fifo`, `file_diff`, and `model_presets` as provided by the server. Authoritative capability values come from `helpers/http.py`; consumers must check capabilities rather than infer them from version strings.
 
-## Discovery and context DTO
+Every schema-2 row carries an opaque context ID and UUID `incarnation`, plus bounded name/activity metadata. Incarnation changes when the underlying context object is replaced; ID/name equality alone does not authorize an action. Server epoch changes invalidate the session. The app additionally captures connection generation and selection revision before asynchronous work.
 
-Discovery uses `AgentContext.all()` with the same chat-versus-background/task distinction as normal `build_snapshot`: omit BACKGROUND contexts and entries owned by scheduler tasks. The inspected runtime has a deployment-wide WebUI session, not per-user chat ACLs. Do not interpret this implementation as a multi-tenant authorization layer.
+Discovery is all eligible chats, not a pin allowlist. Each immutable catalog transaction carries `page_token`, `page_offset`, `catalog_count`, and optional `next_offset`. Follow-up requests send token/offset to the same route. The app validates offsets, duplicate IDs, epoch/cursor/count and returns only a fully assembled catalog. Page loss/expiry fails closed. No fixed five-chat product cap.
 
-All eligible chats are returned, with no product-level count cap or pagination. Separately created subordinate contexts retain their own IDs; ordinary agents sharing a context remain activity in that context. Missing parents, cycles, malformed parent IDs and unexpected parent kinds fail closed. Parent relationships come from `output_data.parent_context_id` with `parent_context_kind == "subordinate"`; no arbitrary output data is exported. Traversal is memoized, with no hierarchy-depth cap.
+Events contain sequence, context ID/incarnation, kind, activity, tool and observation time; optional bounded diff metadata is workspace-relative path plus added/removed counts. Events are not transcript data. The app keeps metadata alerts FIFO without auto-selecting or fetching another chat. Paused state is not a question. Structured option questions/intervention requests are not invented when upstream has no authoritative source.
 
-Every row retains:
+## Selected content and actions
 
-| Field | Meaning |
-| --- | --- |
-| `id` | Actual opaque nonempty A0 context ID, up to 128 characters; not an agent number or prefixed alias |
-| `name` | Chat name masked with the framework secret manager, printable-only, capped at 80 characters; fallback `Untitled chat` |
-| `state` | `idle`, `working`, `thinking`, `browsing`, `delegating`, `finished`, `error`, `paused` |
-| `tool` | Known tool identifier, empty for non-tool events, `tool` for unknown tools |
-| `running` | Boolean from actual `context.is_running()` |
-| `parent_id` | Optional immediate visible parent context ID; absent on roots |
-| `last_activity_at` | Optional finite nonnegative Unix seconds from actual `context.last_message`, never poll time |
-| `created_at` | Optional finite nonnegative Unix seconds from actual `context.created_at` |
+- `POST /api/plugins/a0_notch/selected`: `context`, `incarnation`, nonnegative `log_from`. The server returns at most the latest 80 update-cursor entries, deduplicated in normal first-seen order, under the per-log lock. Text is bounded by JSON-escaped wire bytes. It never calls the localization-changing core snapshot builder. The app probes the log version; main-agent responses only are selected as the last response. This narrow projection omits arbitrary log key/value payloads.
+- `POST /api/plugins/a0_notch/action`: `action` (`send`, `pause`, `resume`, `stop`), `context`, `incarnation`. Send adds `text` (up to 64 KiB UTF-8) and UUID `message_id`.
+- Explicit new-chat creation uses the ordinary `chat_create` API with a generated UUID and empty project. Existing-target operations never create implicitly or redirect to a parent/first chat.
 
-Known-secret masking is not a PII detector; authenticated chat names can still be private. Names exceeding 4096 input characters use the fallback. No transcript, prompt, reasoning, tool arguments/results, attachment, filename, arbitrary error text or response preview is in plugin telemetry. Selected-chat last-response retrieval belongs to the client's normal poll/history workflow.
+Actions resolve the current eligible context object, check the captured incarnation, use ordinary message hook/log/communicate ordering and revalidate object/token/scope after asynchronous preprocessing. No await is held under the registry lock. Dispatch is not a general transaction across all reentrant extension/settings behavior. Message IDs are not assumed idempotent; ambiguous actions are never automatically retried.
 
-## Routes and limits
+## Attachments
 
-POST `/api/plugins/a0_notch/status`, JSON `{}`:
+`POST /api/plugins/a0_notch/attachment` uses bounded multipart fields `context`, `incarnation`, `text`, `message_id`, and 1–8 `attachments`. Each file is at most 8 MiB, whole request at most 16 MiB. Safe basenames and approved text/PDF/PNG/JPEG extensions/content are required. Native reads reject symlink components, directories and special files; no path is uploaded. Security-scoped access is used only for the bounded read.
 
-- `ok: true`, `schema_version: 1`, `plugin_version: "0.6.1"`
-- `server_epoch`: UUID
-- `capabilities: ["discovery", "metadata", "poll", "exact_target_actions"]` — replaces `read_only`
-- `auth: "session_csrf"`, `contexts`: complete eligible snapshot
-- Does not acquire a consumer lease.
+Files are saved with generated names in the normal A0 upload location, passed through `user_message_ui`, logged and communicated as normal attachments. This is not an arbitrary work-directory write. Before dispatch failure, generated files are cleaned; once delivery may have occurred they are preserved. No malware-scan claim is made.
 
-POST `/api/plugins/a0_notch/events` accepts exactly:
+A successful response returns exact `context`, `message`, `attachment_count`, and an `attachments` array of opaque generated basenames, in request order. Native transfer state accepts only a full receipt for its captured operation/target. No full server path or caller path is returned. Upload progress is indeterminate because the current transport exposes no byte callbacks; receipt alone means delivery. Local cancellation cannot promise remote rollback.
 
-- Connect: `{ "action": "connect", "client_id": "<UUID>" }`
-- Poll: `{ "action": "poll", "client_id": "<UUID>", "server_epoch": "<UUID>", "cursor": 0 }`
-- Disconnect: `{ "action": "disconnect", "client_id": "<UUID>", "server_epoch": "<UUID>" }`
+## Lifecycle and privacy
 
-There is one consumer lease, renewed for 15 seconds by accepted connect/poll. Connect starts from current state without replay. Response fields remain `ok`, `schema_version`, `server_epoch`, `cursor`, `reset`, `contexts`, `events`, `dropped`. Events contain `sequence`, actual `context_id`, `kind`, `state`, `tool`, `observed_at`. Kinds: `thinking`, `tool_start`, `tool_end`, `finished`, `error`, `idle`. Counters: `overflow`, `contention`, `no_consumer`, `invalid`.
+`hooks.py` owns install/update/uninstall reset. Upgrade with the supported plugin manager and preserve configuration/activation. The source plugin has no dependencies or daemon. Disconnect/replacement/staleness clears selected content and queued metadata. Pins/aliases/colors are local presentation preferences scoped by authenticated origin/account, not access control. The upstream WebUI account is deployment-wide, not tenant-isolated.
 
-Telemetry input is JSON with known Content-Length, at most **4096 bytes**. Unknown keys/actions/types are rejected; cursors are integers from zero through `2**53-1`, not booleans. UUID identifiers are 36-character strings.
+See [integration](plugin-integration.md), [acceptance evidence](verification.md), and the actual tests for boundaries and verification commands.
 
-Every plugin response is at most **2,097,152 encoded JSON bytes**. Full snapshots never silently truncate. Oversize returns HTTP **503** with `{"ok":false,"error":"snapshot_too_large"}` and invalidates the lease/epoch. This is a response-size bound, not a constant-memory registry bound. No pagination token is supported. Clients must accept 2 MiB, remove five-row limits, and handle discovery capabilities and optional metadata.
+## 0.8 safety and model presets
 
-Other errors: 409 `lease_conflict`; 403 `plugin_disabled` or `authentication_required`; 400 `invalid_request` / `invalid_request_or_configuration`; 503 `unavailable`. Framework auth/CSRF guards may reject first (including login redirects). Responses use `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. Internal exceptions are not returned or logged by plugin handlers.
+The generic encoder fails without resetting telemetry. Catalogs are all-or-nothing, with server context and client aggregate page/byte/deadline budgets; expired transactions are pruned. Eligibility is still rechecked against the registry on continuations, not assumed from a cached authorization result. This bounds accepted catalogs but does not establish a constant-time registry scan.
 
-## Capture and lifecycle truth
+`POST /api/plugins/a0_notch/model_presets` accepts `context`, `incarnation`, and `action` (`list`, `set`, `clear`); `set` also requires the opaque `preset_id` returned by list. The response includes `allowed`, safe current/preset labels and public model names only. Known-secret masking precedes truncation; failure rejects the projection. No model configuration, provider kwargs, keys, URLs or global-setting write is exposed. The adapter revalidates object/incarnation/scope after asynchronous catalog preparation and invokes the existing core `ModelOverride` per-chat preset/clear path. That upstream method is currently non-suspending; a future yielding implementation is refused and requires compatibility review. Presets may affect utility/embedding slots as well as chat models.
 
-Verified hook owners: `before_main_llm_call`, `tool_execute_before`, `tool_execute_after`, `_functions/agent/AgentContext/run_task/end`, and exception-start hooks on Agent/AgentContext. Stream-end and per-iteration completion are not task completion. Successful task futures emit finished; cancelled futures emit idle. Intervention/cancellation exceptions are not error alerts. Run tokens reject stale completion, including removal and rediscovery of an ID.
+Multipart input has an actual-byte cap independent of the claimed Content-Length; every parser spool closes on failure. A preprocessing hook that removes, reorders or substitutes saved attachments is rejected and files are cleaned before dispatch. The native worker reads files with a running aggregate budget, then rechecks target and staging revision. Local preparation failure means not sent; transport failure after dispatch may be uncertain. Every native mutation has an operation UUID, so canceled old work cannot clear a newer task/status/busy state.
 
-A separate child's root agent may have a nonzero agent number; identity is `agent is context.agent0`, not `number == 0`. Its completion changes only its own row. In-context subordinate activity is tagged delegating.
+## Docker and remote deployment
 
-Hooks project known scalars into one **64-event** try-lock ring. Overflow drops oldest; lock contention drops incoming. No networking, serialization, history traversal, settings reads, disk spool or per-event task creation occurs on capture. Registry reconciliation and HTTP serialization run in the API path, not the agent execution path. No additional worker is required for short polling. Slow HTTP writes do not retain the capture lock.
-
-No consumer means no enqueue. Lease expiry is detected on the next hook/API operation, clearing retained telemetry; an inactive process can retain at most 64 stale events until then. State/run maps scale with discovered contexts. New/removed chats reconcile without revoking the active lease; removed rows, state, runs and queued events are purged. Polls return authoritative snapshots; event loss is expected and not a command-delivery mechanism. Loss counters are best-effort under concurrent contention.
-
-Lifecycle `install`, `pre_update`, `uninstall` reset plugin-owned lease/state only. No shared dependency or user data is removed.
-
-## Native actions and response history
-
-All actions use the app-owned session and CSRF, never the telemetry ring. Version 0.6.1 advertises `exact_target_actions`; the companion refuses send/pause/resume/stop if it is absent, with no direct-core fallback.
-
-POST `/api/plugins/a0_notch/action` accepts exactly one of:
-
-- `{action:"send", context:"<existing ID>", text:"<message>", message_id:"<ID>"}`
-- `{action:"pause", context:"<existing ID>"}`
-- `{action:"resume", context:"<existing ID>"}`
-- `{action:"stop", context:"<existing ID>"}`
-
-These notation examples describe JSON fields; real wire payloads require quoted keys. IDs use the existing printable 128-character bound and cannot be blank. Text must be nonblank and at most 65,536 UTF-8 bytes. The JSON body requires a known Content-Length and is capped at 409,600 bytes to accommodate escaping. Multipart, attachments, unknown fields and implicit targets are rejected.
-
-Send returns `{context,message}` acceptance, pause/resume `{context,pause}`, and stop the normal `{context,stopped,message}` response. Missing or ineligible targets, and objects replaced between request resolution and dispatch, return 409 `target_unavailable`; validation failures return 400 `invalid_request`; unexpected failures return fixed 503 `unavailable`. Auth/CSRF guards can reject first, including redirects. No response promises task completion or continued target existence. There is no client-supplied incarnation token: replacement before request resolution is outside this identity guard.
-
-The adapter reuses normal `user_message_ui` preprocessing, message logging, `UserMessage` and `communicate` semantics; stop reuses `stop_context`. It rechecks object identity and scope after the async hook and performs the synchronous dispatch under the real registry lock. No create-capable lookup is called. Scope settings, scheduler mutations and reentrant hooks are not made transactional by this lock; see the integration document for boundaries. Preprocessing effects cannot be rolled back.
-
-Explicit creation remains POST `/api/chat_create` with a fresh `new_context` UUID and empty `project_name`; selected-chat content remains POST `/api/poll` with exact `context`, `log_from`, `notifications_from` and `timezone`. The native preview examines the latest 80 log updates, not arbitrary old history. Connecting never automatically selects or reads an existing chat.
-
-Never automatically retry ambiguous writes: `message_id` is not a proven idempotency key. Sending can unpause/intervene through normal core behavior. Selection alone never sends anything. Do not log response contents.
-
-## Compatibility and verification
-
-`allowed_context_ids` and `share_context_names` are obsolete and ignored, including saved overrides. Defaults are `{}`; no runtime config rewrite is required. Old 0.5.0 clients require a coordinated upgrade despite schema_version remaining 1. Upgrading exposes eligible chat names to the authenticated companion without the old toggle; communicate that change before deployment.
-
-Run plugin checks with the framework interpreter:
-
-```sh
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/a0 /opt/venv-a0/bin/python -m pytest -q -p no:cacheprovider tests/test_m5.py tests/test_plugin_discovery.py
-```
-
-Tests use synthetic registries/futures and the real framework Flask route/decorator implementation with fixture sessions and patched discovery. They do not prove deployed hooks, native interoperability or live performance. See `plugin-integration.md` for source grounding and deployment boundaries; old M5 verification reports describe earlier releases, not 0.6 acceptance.
+Unix-domain sockets cannot cross the Linux VM/macOS kernel boundary through a bind-mounted pathname. Supported Docker Desktop access uses a genuinely loopback-bound published WebUI endpoint or secured loopback tunnel. Remote access uses authenticated HTTPS with normal certificate validation. Authentication and CSRF remain mandatory; no host bridge, cross-kernel socket, anonymous relay or trust-all TLS workaround is supplied.

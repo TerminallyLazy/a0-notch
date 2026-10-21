@@ -6,19 +6,31 @@ import NotchCore
 
 /// Credential scope includes the normalized origin and username. Never UserDefaults.
 enum NotchKeychain {
+    enum Failure: Error, LocalizedError {
+        case unavailable
+        var errorDescription: String? { "Keychain is locked or unavailable. Unlock it and try again; the credential operation did not complete." }
+    }
+    static func check(_ status: OSStatus) throws -> Bool {
+        if status == errSecItemNotFound { return false }
+        guard status == errSecSuccess else { throw Failure.unavailable }
+        return true
+    }
+    static func checkWrite(_ status: OSStatus) throws {
+        guard status == errSecSuccess else { throw Failure.unavailable }
+    }
     private static func query(origin: String, username: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: "community.agentzero.notch.connection:" + origin,
          kSecAttrAccount as String: username]
     }
-    static func read(origin: String, username: String) -> String? {
+    static func read(origin: String, username: String) throws -> String? {
         var query = query(origin: origin, username: username)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        guard try check(SecItemCopyMatching(query as CFDictionary, &result)) else { return nil }
+        guard let data = result as? Data, let value = String(data: data, encoding: .utf8) else { throw Failure.unavailable }
+        return value
     }
     static func save(_ password: String, origin: String, username: String) throws {
         let query = query(origin: origin, username: username)
@@ -27,11 +39,11 @@ enum NotchKeychain {
         if result == errSecItemNotFound {
             var item = query.merging(attributes) { _, new in new }
             item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-            guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else { throw LiveError.authentication }
-        } else if result != errSecSuccess { throw LiveError.authentication }
+            try checkWrite(SecItemAdd(item as CFDictionary, nil))
+        } else { try checkWrite(result) }
     }
-    static func remove(origin: String, username: String) {
-        SecItemDelete(query(origin: origin, username: username) as CFDictionary)
+    static func remove(origin: String, username: String) throws {
+        _ = try check(SecItemDelete(query(origin: origin, username: username) as CFDictionary))
     }
 }
 
@@ -39,6 +51,7 @@ struct ConnectionSettings: View {
     @Bindable var store: IslandStore
     @State private var password = ""
     @State private var savePassword = false
+    @State private var keychainMessage = ""
     @State private var confirmForget = false
     @State private var forgetAccount: (origin: String, username: String)?
     @State private var loginStatus = SMAppService.mainApp.status
@@ -113,12 +126,46 @@ struct ConnectionSettings: View {
                         }
                     }.disabled(!validAccount || store.connecting)
                 }.font(A0Brand.ui(11))
+                if !keychainMessage.isEmpty { Text(keychainMessage).foregroundStyle(A0Theme.accent) }
+                GroupBox("Model configuration") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(store.modelInformation).font(A0Brand.ui(13, weight: .medium))
+                        Text(store.modelSettingsGuidance).font(A0Brand.ui(11)).foregroundStyle(A0Theme.muted)
+                        Button("Open A0 model settings (in WebUI)", action: store.openModelSettings)
+                            .disabled((try? LiveOrigin(store.connectedOrigin.isEmpty ? store.connectionURL : store.connectedOrigin)) == nil)
+                        Text("Opens the WebUI. Choose this chat's model preset, or Settings → Models. No global settings are changed by a0_notch.")
+                            .font(A0Brand.ui(11)).foregroundStyle(A0Theme.muted)
+                    }.padding(8)
+                }
+                GroupBox("Microphone dictation") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Toggle("Require on-device recognition", isOn: $store.dictationOnDeviceOnly)
+                        Picker("Speech language", selection: $store.dictationLocale) {
+                            ForEach(Array(Set(AppleDictationDriver.locales + [store.dictationLocale])).sorted(), id: \.self) { identifier in
+                                Text(Locale.current.localizedString(forIdentifier: identifier) ?? identifier).tag(identifier)
+                            }
+                        }
+                        Text(store.dictation.supportsOnDevice(locale: store.dictationLocale)
+                             ? "On-device recognition is supported for this language."
+                             : "On-device recognition is not currently supported for this language.")
+                            .font(A0Brand.ui(11)).foregroundStyle(A0Theme.muted)
+                        Text("Private by default. Turning this off allows Apple server recognition only when on-device recognition is unavailable. Every recording requires your explicit Start microphone consent. Recordings stop at 45 seconds; review and insert the transcript, then send separately. No audio or transcripts are saved by a0_notch.")
+                            .font(A0Brand.ui(11)).foregroundStyle(A0Theme.muted)
+                        Text("Language and recognition preference are saved separately for each connected server/account. Connect before changing them.")
+                            .font(A0Brand.ui(11)).foregroundStyle(A0Theme.muted)
+                        if store.dictation.active { Button("Cancel recording", action: store.cancelDictation) }
+                        HStack {
+                            Button("Microphone privacy…") { openPrivacy("Privacy_Microphone") }
+                            Button("Speech privacy…") { openPrivacy("Privacy_SpeechRecognition") }
+                        }
+                    }.padding(8).disabled(store.connectedOrigin.isEmpty)
+                }
                 GroupBox("Behavior") {
                     VStack(alignment: .leading, spacing: 12) {
                         Stepper("Close after \(Int(store.autoCloseSeconds)) seconds", value: $store.autoCloseSeconds, in: 15...300, step: 15)
                         Stepper("Hide after \(Int(store.absenceMinutes)) minutes without mouse movement", value: $store.absenceMinutes, in: 1...30)
-                        Toggle("Open for selected-chat errors and completion", isOn: $store.autoOpenEvents)
-                        Text("Errors stay open until dismissed. Completion stays for 5.2 seconds unless you interact. Other chats never change your selection.")
+                        Toggle("Open for chat alerts and completion", isOn: $store.autoOpenEvents)
+                        Text("Alerts are FIFO and stay open until resolved or dismissed. Completion gets 5.2 seconds, excluding alert time. Other chats never change your selection or load content automatically.")
                             .font(A0Brand.ui(11)).foregroundStyle(A0Theme.muted)
                     }.padding(8)
                 }
@@ -147,13 +194,19 @@ struct ConnectionSettings: View {
         .confirmationDialog("Remove the saved password for this server and username?", isPresented: $confirmForget) {
             Button("Forget password", role: .destructive) {
                 if let account = forgetAccount {
-                    NotchKeychain.remove(origin: account.origin, username: account.username)
+                    do {
+                        try NotchKeychain.remove(origin: account.origin, username: account.username)
+                        keychainMessage = "Saved password removed (or already absent)."
+                    } catch { keychainMessage = error.localizedDescription }
                 }
             }
         }
         .onChange(of: store.connectionURL) { _, _ in password = ""; savePassword = false }
         .onChange(of: store.connectionUsername) { _, _ in password = ""; savePassword = false }
         .onChange(of: store.live.mode) { _, mode in if mode == .live { password = "" } }
+    }
+    private func openPrivacy(_ pane: String) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?" + pane) { NSWorkspace.shared.open(url) }
     }
     private func run(test: Bool) {
         // connectLive captures credentials synchronously; do not retain the field

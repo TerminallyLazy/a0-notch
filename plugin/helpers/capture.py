@@ -8,12 +8,14 @@ def display_id(context):
     return id if valid_id(id) else None
 
 
-def observe(agent, kind, tool_name=''):
+def observe(agent, kind, tool_name='', diff=None):
     try:
         if agent is None or not relay.client:
             return
         root = display_id(agent.context)
         if root is None:
+            return
+        if root in relay.incarnations and getattr(agent.context, '_a0_notch_incarnation', None) is None:
             return
         tool = tool_name if type(tool_name) is str and tool_name in TOOLS else 'tool'
         if kind == 'thinking':
@@ -24,7 +26,8 @@ def observe(agent, kind, tool_name=''):
             state = 'browsing' if tool in ('browser', 'search_engine') else 'delegating' if tool in ('call_subordinate', 'delegate_parallel') else 'working'
         if kind != 'error' and agent is not agent.context.agent0:
             state = 'delegating'
-        relay.capture(root, kind, state, tool)
+        relay.capture(root, kind, state, tool, diff=diff,
+                      incarnation=getattr(agent.context, '_a0_notch_incarnation', None))
     except Exception:
         pass
 
@@ -56,7 +59,10 @@ def task_started(data):
         # A separately created child owns its completion, regardless of number.
         if context is None or root != context.id:
             return
-        token = relay.begin_run(root)
+        incarnation = getattr(context, '_a0_notch_incarnation', None)
+        if root in relay.incarnations and incarnation is None:
+            return
+        token = relay.begin_run(root, incarnation=incarnation)
         if token is None:
             return
         def done(future):
@@ -67,7 +73,7 @@ def task_started(data):
                     kind, state = 'error', 'error'
                 else:
                     kind, state = 'finished', 'finished'
-                relay.capture(root, kind, state, run=token)
+                relay.capture(root, kind, state, run=token, incarnation=incarnation)
             except Exception:
                 pass
         task.add_done_callback(done)

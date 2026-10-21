@@ -23,8 +23,8 @@ for asset in AgentZeroSymbol.png AgentZeroWordmark.png AgentZeroIcon.png rubik-v
 done
 (cd "$BRANDING" && shasum -a 256 -c SHA256SUMS)
 expect CFBundlePackageType APPL
-expect CFBundleShortVersionString 1.0
-expect CFBundleVersion 1
+expect CFBundleShortVersionString 0.8.0
+expect CFBundleVersion 7
 expect LSMinimumSystemVersion 14.0
 expect LSUIElement true
 [[ $(plutil -type LSUIElement "$PLIST") == boolean ]]

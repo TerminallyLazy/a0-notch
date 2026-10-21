@@ -14,7 +14,7 @@ from helpers import api, cache
 from usr.plugins.a0_notch.helpers import relay as mod, capture, http
 
 CID = str(uuid.uuid4())
-ROW = dict(id='root', name='Context 1', running=True, state='working', tool='')
+ROW = dict(incarnation='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', id='root', name='Context 1', running=True, state='working', tool='')
 
 @pytest.fixture
 def relay():
@@ -163,9 +163,9 @@ def test_http_authenticated(client):
     assert response.status_code == 200
     assert response.json['contexts'][0]['id'] == 'root'
     assert response.headers['Cache-Control'] == 'no-store'
-    assert response.json['schema_version'] == 1
-    assert response.json['plugin_version'] == '0.6.1'
-    assert response.json['capabilities'] == ['discovery', 'metadata', 'poll', 'exact_target_actions']
+    assert response.json['schema_version'] == 2
+    assert response.json['plugin_version'] == '0.8.0'
+    assert set(['discovery', 'metadata', 'poll', 'incarnation_actions', 'paged_discovery', 'attachments']).issubset(response.json['capabilities'])
     assert response.json['auth'] == 'session_csrf'
 
 
@@ -176,15 +176,17 @@ def test_http_legacy_config_not_read(client, monkeypatch):
     assert client.post(PATH, json={}, headers=HEADERS).status_code == 200
 
 
-def test_http_oversized_snapshot_revokes_lease(client, monkeypatch):
+def test_http_large_catalog_is_paginated_preserving_lease(client, monkeypatch):
     path = '/api/plugins/a0_notch/events'
     response = client.post(path, json=dict(action='connect', client_id=CID), headers=HEADERS)
     assert response.status_code == 200 and http.relay.client == CID
     monkeypatch.setattr(http, 'contexts', lambda: [dict(ROW, id=f'c{i}', name='z' * 80) for i in range(16000)])
     response = client.post(PATH, json={}, headers=HEADERS)
-    assert response.status_code == 503
-    assert response.json == {'ok': False, 'error': 'snapshot_too_large'}
-    assert http.relay.client is None and not http.relay.allowed
+    assert response.status_code == 200
+    assert response.json['catalog_count'] == 16000
+    assert len(response.json['contexts']) == 128
+    assert response.json['next_offset'] == 128
+    assert http.relay.client == CID
 
 
 def test_http_discovery_failure_does_not_return_partial_data(client, monkeypatch):

@@ -31,7 +31,7 @@ ditto "$BRANDING" "$APP/Contents/Resources/Branding"
 cp app/A0Notch.icns "$APP/Contents/Resources/A0Notch.icns"
 chmod +x "$APP/Contents/MacOS/A0Notch"
 xattr -cr "$APP"
-codesign --force --sign - "$APP"
+codesign --force --options runtime --entitlements app/A0Notch.entitlements --sign - "$APP"
 codesign --verify --strict "$APP"
 "$ROOT/scripts/check-app-bundle.sh" "$APP"
 # Preserve the previous package until the new one has passed all checks.
